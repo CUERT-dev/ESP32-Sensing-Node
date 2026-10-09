@@ -1,0 +1,13 @@
+{
+  "cmake.configureOnOpen": false,
+  "idf.customExtraVars": {
+    "IDF_PATH": "C:\\esp\\v6.1\\esp-idf",
+    "IDF_TOOLS_PATH": "C:\\Espressif",
+    "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\tools\\python\\v6.1\\venv-win",
+    "PYTHONUTF8": "1"
+  },
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "files.associations": {
+    "sdkconfig*": "properties"
+  }
+}
