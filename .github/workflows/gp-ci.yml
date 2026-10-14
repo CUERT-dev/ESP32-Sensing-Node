@@ -1,0 +1,112 @@
+name: gp-ci
+
+on:
+  pull_request:
+    branches: [Testing, Maintaining]
+  push:
+    branches: [Testing, Maintaining, 'ci/**']
+
+concurrency:
+  group: gp-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: espressif/idf:v6.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          . "$IDF_PATH/export.sh" >/dev/null
+          idf.py --version
+          cmake --version | head -n 1
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          { idf.py set-target esp32 && idf.py build; } 2>&1 | tee build.log
+          idf.py size | tee size.txt
+          idf.py size-components > size-components.txt
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp build.log size.txt size-components.txt out/
+          cp build/flasher_args.json build/project_description.json out/
+          python3 - <<'PY'
+          import json, os, shutil
+          args = json.load(open("build/flasher_args.json"))
+          for rel in args["flash_files"].values():
+              dst = os.path.join("out", rel)
+              os.makedirs(os.path.dirname(dst) or "out", exist_ok=True)
+              shutil.copy(os.path.join("build", rel), dst)
+          PY
+          cp build/*.elf build/*.map out/
+          {
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "candidate_sha=$CANDIDATE_SHA"
+            echo "built_commit=$(git rev-parse HEAD)"
+            echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > out/SHA.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.CANDIDATE_SHA }}
+          path: out/
+          if-no-files-found: error
+
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check harness
+        id: harness
+        run: |
+          if [ -f tests/host/CMakeLists.txt ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Host tests: Not ready (tests/host/CMakeLists.txt missing)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install tools
+        if: steps.harness.outputs.ready == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc g++
+
+      - name: Configure
+        if: steps.harness.outputs.ready == 'true'
+        run: cmake -S tests/host -B build/host -G Ninja
+
+      - name: Build
+        if: steps.harness.outputs.ready == 'true'
+        run: cmake --build build/host
+
+      - name: Run
+        if: steps.harness.outputs.ready == 'true'
+        run: ctest --test-dir build/host --output-on-failure
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.harness.outputs.ready == 'true'
+        with:
+          name: host-test-reports-${{ env.CANDIDATE_SHA }}
+          path: build/host/Testing/
+          if-no-files-found: ignore
