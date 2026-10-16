@@ -9,5 +9,6 @@
   "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
   "files.associations": {
     "sdkconfig*": "properties"
-  }
+  },
+  "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf"
 }
