@@ -1,15 +1,12 @@
 idf_component_register(
     SRCS
         "main.c"
-        "lib/gateway/src/gateway.c"
-        "lib/gp-protocol/src/gp-protocol.c"
-
     INCLUDE_DIRS
         "."
-        "lib/gateway/include"
-        "lib/gp-protocol/include"
-
     REQUIRES
+        gateway
+        gp_protocol
+        gp_common
         freertos
         log
         esp_driver_gpio
