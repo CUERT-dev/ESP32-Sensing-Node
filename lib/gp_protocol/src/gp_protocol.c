@@ -1,4 +1,4 @@
-#include "gp-protocol.h"
+#include "gp_protocol.h"
 #include <limits.h>
 
 /*

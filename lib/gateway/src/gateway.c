@@ -9,8 +9,8 @@ static void parser_resync(UartRx *rx)
      * of the next start-of-frame marker.
      */
     if (rx->used > 0u &&
-        rx->frame[rx->used - 1u] == GP_UART_SOF0) {
-        rx->frame[0] = GP_UART_SOF0;
+        rx->bytes[rx->used - 1u] == GP_UART_SOF0) {
+        rx->bytes[0] = GP_UART_SOF0;
         rx->used = 1u;
     } else {
         rx->used = 0u;
@@ -56,7 +56,7 @@ GpResult UartRx_Feed(UartRx *rx,
          */
         if (rx->used == 0u) {
             if (byte == GP_UART_SOF0) {
-                rx->frame[0] = byte;
+                rx->bytes[0] = byte;
                 rx->used = 1u;
             }
 
@@ -68,10 +68,10 @@ GpResult UartRx_Feed(UartRx *rx,
          */
         if (rx->used == 1u) {
             if (byte == GP_UART_SOF1) {
-                rx->frame[1] = byte;
+                rx->bytes[1] = byte;
                 rx->used = 2u;
             } else if (byte == GP_UART_SOF0) {
-                rx->frame[0] = byte;
+                rx->bytes[0] = byte;
                 rx->used = 1u;
             } else {
                 rx->used = 0u;
@@ -80,16 +80,16 @@ GpResult UartRx_Feed(UartRx *rx,
             continue;
         }
 
-        rx->frame[rx->used++] = byte;
+        rx->bytes[rx->used++] = byte;
 
         /*
          * Once the five-byte header is available,
          * reject unsupported versions, kinds, or lengths.
          */
         if (rx->used == 5u &&
-            (rx->frame[2] != GP_UART_VERSION ||
-             rx->frame[3] != GP_UART_KIND ||
-             rx->frame[4] != GP_UART_PAYLOAD_LEN)) {
+            (rx->bytes[2] != GP_UART_VERSION ||
+             rx->bytes[3] != GP_UART_KIND ||
+             rx->bytes[4] != GP_UART_PAYLOAD_LEN)) {
 
             parser_resync(rx);
             *consumed = i;
@@ -104,7 +104,7 @@ GpResult UartRx_Feed(UartRx *rx,
             TargetSample candidate;
 
             GpResult result = GP_DecodeUart(
-                rx->frame,
+                rx->bytes,
                 GP_UART_FRAME_LEN,
                 &candidate
             );
@@ -169,7 +169,8 @@ GpResult Gateway_Init(Gateway *gateway,
     gateway->user = user;
     gateway->max_queue_ms = max_queue_ms;
     gateway->last_sequence = 0u;
-    gateway->have_sequence = 0u;
+    gateway->seen = false;
+    gateway->initialized = true;
 
     return GP_OK;
 }
@@ -183,7 +184,8 @@ GpResult Gateway_Forward(Gateway *gateway,
 
     if (gateway == NULL ||
         command == NULL ||
-        gateway->write == NULL) {
+        gateway->write == NULL ||
+        !gateway->initialized) {
         return GP_BAD_ARG;
     }
 
@@ -209,7 +211,7 @@ GpResult Gateway_Forward(Gateway *gateway,
      * Establish the initial sequence baseline only from
      * a valid neutral command with ARM clear.
      */
-    if (!gateway->have_sequence) {
+    if (!gateway->seen) {
         if (!is_valid_neutral_disarmed(command)) {
             return GP_INVALID;
         }
@@ -236,7 +238,7 @@ GpResult Gateway_Forward(Gateway *gateway,
      */
     if (result == GP_OK) {
         gateway->last_sequence = command->sequence;
-        gateway->have_sequence = 1u;
+        gateway->seen = true;
     }
 
     return result;
@@ -246,6 +248,6 @@ void Gateway_Reset(Gateway *gateway)
 {
     if (gateway != NULL) {
         gateway->last_sequence = 0u;
-        gateway->have_sequence = 0u;
+        gateway->seen = false;
     }
 }
