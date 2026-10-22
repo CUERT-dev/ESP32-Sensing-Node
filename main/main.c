@@ -15,24 +15,64 @@
 
 /* UART configuration */
 #define UART_PORT       UART_NUM_1
-#define UART_TX_PIN     GPIO_NUM_16   /* IO16 -> Blackpill PA10 (USART1 RX) */
-#define UART_RX_PIN     GPIO_NUM_17   /* IO17 <- Blackpill PA9  (USART1 TX) */
+#define UART_TX_PIN     GPIO_NUM_17   /* ESP TX -> Blackpill PA10 (USART1 RX) */
+#define UART_RX_PIN     GPIO_NUM_16   /* ESP RX <- Blackpill PA9  (USART1 TX) */
 #define UART_BAUD_RATE  115200
 
 /* TWAI / CAN configuration */
-#define CAN_TX_PIN      GPIO_NUM_21
-#define CAN_RX_PIN      GPIO_NUM_22
+#define CAN_TX_PIN      GPIO_NUM_19
+#define CAN_RX_PIN      GPIO_NUM_18
 #define CAN_BITRATE     500000
 
 #define MAX_QUEUE_MS    100
 #define CAN_TX_QUEUE_LENGTH 10
 #define UART_READ_BUFFER_SIZE 128
 
+/* ---- DEBUG LOGGING: set DEBUG_LOG to 0 and every debug line is compiled out ---- */
+#define DEBUG_LOG       1
+#define DEBUG_EVERY_N   10u   /* print 1 of every N messages. 1 = print all */
+
 static Gateway gateway;
 static UartRx uart_rx;
 static QueueHandle_t can_tx_queue;
 static twai_node_handle_t can_node;
 static const char *TAG = "sensing_node";
+
+#if DEBUG_LOG
+static uint32_t dbg_rx_count;
+static uint32_t dbg_cmd_count;
+static uint32_t dbg_bad_count;
+static uint32_t dbg_can_count;
+
+/* True for the 1st, (N+1)th, (2N+1)th ... call on this counter. */
+#define DBG_DUE(counter) (((counter)++ % DEBUG_EVERY_N) == 0u)
+
+/* Bytes -> "A5 5A 02 ..." text. Stops before the buffer is full. */
+static void DbgHex(char *out, size_t cap, const uint8_t *bytes, size_t length)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    size_t o = 0u;
+    size_t i;
+
+    for (i = 0u; i < length && (o + 4u) < cap; i++) {
+        out[o++] = digits[bytes[i] >> 4];
+        out[o++] = digits[bytes[i] & 0x0Fu];
+        out[o++] = ' ';
+    }
+    out[o] = '\0';
+}
+
+static const char *DbgResult(GpResult result)
+{
+    if (result == GP_OK) {
+        return "OK";
+    }
+    if (result == GP_PENDING) {
+        return "PENDING";
+    }
+    return "REJECTED";
+}
+#endif
 
 static esp_err_t UART_Init(void)
 {
@@ -142,6 +182,16 @@ static void CanTxTask(void *argument)
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "TWAI transmit failed: %s", esp_err_to_name(err));
         }
+
+#if DEBUG_LOG
+        /* DEBUG 3: frame really left the CAN peripheral */
+        if (err == ESP_OK && DBG_DUE(dbg_can_count)) {
+            char hex[40];
+            DbgHex(hex, sizeof(hex), queued_frame.data, queued_frame.dlc);
+            ESP_LOGI(TAG, "CAN TX done id=0x%03X dlc=%u data: %s",
+                     (unsigned)queued_frame.id, (unsigned)queued_frame.dlc, hex);
+        }
+#endif
     }
 }
 
@@ -187,6 +237,9 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "CUERT ESP32 sensing node started");
+#if DEBUG_LOG
+    ESP_LOGI(TAG, "DEBUG logging ON: printing 1 of every %u messages", (unsigned)DEBUG_EVERY_N);
+#endif
 
     while (1) {
         if (have_pending_command) {
@@ -222,6 +275,17 @@ void app_main(void)
             read_length = (size_t)bytes_read;
             read_offset = 0u;
             chunk_received_at = xTaskGetTickCount();
+
+#if DEBUG_LOG
+            /* DEBUG 1: raw bytes received from the Blackpill. Must start with A5 5A */
+            if (DBG_DUE(dbg_rx_count)) {
+                char hex[96];
+                size_t shown = (read_length < 28u) ? read_length : 28u;
+                DbgHex(hex, sizeof(hex), read_buffer, shown);
+                ESP_LOGI(TAG, "UART RX %u bytes: %s%s",
+                         (unsigned)read_length, hex, (read_length > shown) ? "..." : "");
+            }
+#endif
         }
 
         size_t consumed = 0u;
@@ -241,6 +305,14 @@ void app_main(void)
         }
         read_offset += consumed;
 
+#if DEBUG_LOG
+        /* DEBUG 2a: frame was rejected by the parser (bad header, CRC or range) */
+        if (result == GP_INVALID && DBG_DUE(dbg_bad_count)) {
+            ESP_LOGW(TAG, "UART frame INVALID (bad header/CRC/range), consumed=%u",
+                     (unsigned)consumed);
+        }
+#endif
+
         if (result == GP_OK) {
             result = Gateway_Forward(&gateway, &command, QueueAgeMs(chunk_received_at));
             if (result == GP_PENDING) {
@@ -250,6 +322,19 @@ void app_main(void)
             } else if (result != GP_OK) {
                 ESP_LOGW(TAG, "UART command rejected: %d", (int)result);
             }
+
+#if DEBUG_LOG
+            /* DEBUG 2b: decoded message values and what the gateway did with it */
+            if (DBG_DUE(dbg_cmd_count)) {
+                ESP_LOGI(TAG, "CMD seq=%u thr=%u str=%d flags=0x%02X (valid=%u arm=%u deadman=%u) gateway=%s(%d)",
+                         (unsigned)command.sequence, (unsigned)command.throttle_pm,
+                         (int)command.steering_pm, (unsigned)command.flags,
+                         (unsigned)(command.flags & 1u),
+                         (unsigned)((command.flags >> 1) & 1u),
+                         (unsigned)((command.flags >> 2) & 1u),
+                         DbgResult(result), (int)result);
+            }
+#endif
         } else if (result != GP_PENDING && result != GP_INVALID) {
             ESP_LOGW(TAG, "UART processing failed: %d", (int)result);
         }

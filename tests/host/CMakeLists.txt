@@ -16,3 +16,10 @@ target_include_directories(gateway_integration_test PRIVATE
 )
 
 add_test(NAME gateway_integration_test COMMAND gateway_integration_test)
+
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    REQUIRES gateway gp_protocol
+             esp_driver_uart esp_driver_twai esp_driver_gpio
+             esp_timer)
