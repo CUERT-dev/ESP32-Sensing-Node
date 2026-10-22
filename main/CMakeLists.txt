@@ -1,1 +1,15 @@
-idf_component_register(SRCS "main.c" INCLUDE_DIRS "." REQUIRES freertos log)
+idf_component_register(
+    SRCS
+        "main.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        gateway
+        gp_protocol
+        gp_common
+        freertos
+        log
+        esp_driver_gpio
+        esp_driver_uart
+        esp_driver_twai
+)

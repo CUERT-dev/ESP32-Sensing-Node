@@ -1,0 +1,29 @@
+cmake_minimum_required(VERSION 3.20)
+project(esp32_host_tests LANGUAGES C)
+
+enable_testing()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+
+add_executable(test_gateway
+    test_gateway.c
+    "${ROOT}/main/lib/gateway/src/gateway.c"
+    "${ROOT}/main/lib/gp-protocol/src/gp-protocol.c"
+)
+
+target_include_directories(test_gateway PRIVATE
+    "${ROOT}/main/lib/gateway/include"
+    "${ROOT}/main/lib/gp-protocol/include"
+)
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_gateway PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+endif()
+
+add_test(NAME GatewayHostTests COMMAND test_gateway)

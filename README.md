@@ -1,7 +1,8 @@
 # ESP32-Sensing-Node
 
-CUERT ESP32 sensing firmware, using C and the native ESP-IDF CMake build system.
-The starter logs a heartbeat once per second and does not configure sensor pins.
+CUERT ESP32 firmware, using C and the native ESP-IDF CMake build system. The
+application reads revision-10 command frames on UART1 and forwards validated
+commands as standard CAN frames through the ESP32 TWAI controller.
 
 ## Hardware baseline
 
@@ -11,6 +12,11 @@ Pin count alone does not identify the chip or flash capacity: check the metal
 module's marking. The initial flash configuration uses a conservative 2 MB,
 DIO, 40 MHz baseline. Change flash size in `idf.py menuconfig` after confirming
 the module's actual capacity; 38-pin boards often have 4 MB.
+
+UART1 uses GPIO17 (TX), GPIO16 (RX), and 115200 baud. TWAI uses GPIO21 (TX),
+GPIO22 (RX), and 500 kbit/s. The ESP32 has no built-in CAN transceiver; connect
+an external transceiver between the ESP32 and the CAN bus. Confirm pin wiring
+and bus termination before connecting hardware.
 
 ## One-time Windows setup
 
@@ -96,8 +102,8 @@ ESP32's built-in ROM download bootloader over USB-to-UART, and writes the
 bootloader, partition table, and application at their generated offsets.
 An ST-Link is not required for normal USB flashing.
 
-Expected output is `CUERT ESP32 sensing node started`, then a heartbeat each
-second. Exit the monitor with Ctrl+]. VS Code also provides ESP-IDF commands
+Expected output includes `CUERT ESP32 sensing node started`. Exit the monitor
+with Ctrl+]. VS Code also provides ESP-IDF commands
 for building, selecting a port, flashing using UART, and monitoring.
 
 If no COM port appears, check the cable and the driver for the board's actual
