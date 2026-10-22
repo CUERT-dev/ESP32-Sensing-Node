@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "esp_err.h"
@@ -12,6 +13,10 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
+
+/*internal LED*/
+#define LED_PIN GPIO_NUM_2
+
 
 /* UART configuration */
 #define UART_PORT       UART_NUM_1
@@ -30,7 +35,7 @@
 
 /* ---- DEBUG LOGGING: set DEBUG_LOG to 0 and every debug line is compiled out ---- */
 #define DEBUG_LOG       1
-#define DEBUG_EVERY_N   10u   /* print 1 of every N messages. 1 = print all */
+#define DEBUG_EVERY_N   1u   /* print 1 of every N messages. 1 = print all */
 
 static Gateway gateway;
 static UartRx uart_rx;
@@ -174,24 +179,43 @@ static void CanTxTask(void *argument)
         };
 
         esp_err_t err = twai_node_transmit(can_node, &tx_frame, -1);
+
         if (err == ESP_OK) {
-            /* Keep queued_frame alive until the asynchronous TX is complete. */
-            err = twai_node_transmit_wait_all_done(can_node, pdMS_TO_TICKS(10));
+            err = twai_node_transmit_wait_all_done(
+                can_node,
+                pdMS_TO_TICKS(100)
+            );
         }
 
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "TWAI transmit failed: %s", esp_err_to_name(err));
-        }
-
-#if DEBUG_LOG
-        /* DEBUG 3: frame really left the CAN peripheral */
-        if (err == ESP_OK && DBG_DUE(dbg_can_count)) {
+        if (err == ESP_OK) {
             char hex[40];
             DbgHex(hex, sizeof(hex), queued_frame.data, queued_frame.dlc);
-            ESP_LOGI(TAG, "CAN TX done id=0x%03X dlc=%u data: %s",
-                     (unsigned)queued_frame.id, (unsigned)queued_frame.dlc, hex);
+
+            ESP_LOGI(TAG,
+                    "CAN TX SUCCESS: ID=0x%03X DLC=%u DATA=[%s]",
+                    (unsigned)queued_frame.id,
+                    (unsigned)queued_frame.dlc,
+                    hex);
+
+            gpio_set_level(LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            gpio_set_level(LED_PIN, 0);
+        } else {
+    ESP_LOGE(TAG, "CAN TX FAILED: %s", esp_err_to_name(err));
+
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Attempting CAN bus-off recovery...");
+
+        esp_err_t recover_err = twai_node_recover(can_node);
+
+        if (recover_err == ESP_OK) {
+            ESP_LOGI(TAG, "CAN recovery initiated");
+        } else {
+            ESP_LOGE(TAG, "CAN recovery request failed: %s",
+                     esp_err_to_name(recover_err));
         }
-#endif
+    }
+}
     }
 }
 
@@ -225,6 +249,10 @@ void app_main(void)
     ESP_ERROR_CHECK(UART_Init());
     ESP_ERROR_CHECK(CAN_Init());
     UartRx_Init(&uart_rx);
+
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
 
     if (Gateway_Init(&gateway, CanQueueWrite, NULL, MAX_QUEUE_MS) != GP_OK) {
         ESP_LOGE(TAG, "Failed to initialize gateway");
