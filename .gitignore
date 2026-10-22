@@ -7,3 +7,13 @@
 !.vscode/settings.json
 __pycache__/
 *.pyc
+/out/
+/artifact/
+/cmake-build-*/
+/.cache/
+compile_commands.json
+.idea/
+*.swp
+*~
+Thumbs.db
+.DS_Store
