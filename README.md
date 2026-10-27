@@ -13,8 +13,8 @@ module's marking. The initial flash configuration uses a conservative 2 MB,
 DIO, 40 MHz baseline. Change flash size in `idf.py menuconfig` after confirming
 the module's actual capacity; 38-pin boards often have 4 MB.
 
-UART1 uses GPIO17 (TX), GPIO16 (RX), and 115200 baud. TWAI uses GPIO21 (TX),
-GPIO22 (RX), and 500 kbit/s. The ESP32 has no built-in CAN transceiver; connect
+UART1 uses GPIO17 (TX), GPIO16 (RX), and 115200 baud. TWAI uses GPIO19 (TX),
+GPIO18 (RX), and 500 kbit/s. The ESP32 has no built-in CAN transceiver; connect
 an external transceiver between the ESP32 and the CAN bus. Confirm pin wiring
 and bus termination before connecting hardware.
 

@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 /*internal LED*/
 #define LED_PIN GPIO_NUM_2
@@ -35,19 +36,26 @@
 
 /* ---- DEBUG LOGGING: set DEBUG_LOG to 0 and every debug line is compiled out ---- */
 #define DEBUG_LOG       1
-#define DEBUG_EVERY_N   1u   /* print 1 of every N messages. 1 = print all */
+#define DEBUG_EVERY_N   10u  /* keep serial printing below the monitor bandwidth */
 
 static Gateway gateway;
 static UartRx uart_rx;
 static QueueHandle_t can_tx_queue;
 static twai_node_handle_t can_node;
 static const char *TAG = "sensing_node";
+typedef struct {
+    GpCanFrame frame;
+    TickType_t queued_at;
+} QueuedCanFrame;
+static TaskHandle_t can_tx_task;
+static _Atomic uint32_t uart_bytes_total, uart_frames_total, gateway_rejected;
+static _Atomic uint32_t can_queue_busy;
+static _Atomic uint32_t can_bus_errors_total, can_last_error;
 
 #if DEBUG_LOG
 static uint32_t dbg_rx_count;
 static uint32_t dbg_cmd_count;
 static uint32_t dbg_bad_count;
-static uint32_t dbg_can_count;
 
 /* True for the 1st, (N+1)th, (2N+1)th ... call on this counter. */
 #define DBG_DUE(counter) (((counter)++ % DEBUG_EVERY_N) == 0u)
@@ -118,6 +126,29 @@ static esp_err_t UART_Init(void)
     );
 }
 
+/* The queue becoming empty is not a transmission-success indication. Only
+ * this callback reports ACKed success with normal (non-self-test) CAN mode. */
+static bool CanTxDone(twai_node_handle_t node, const twai_tx_done_event_data_t *event,
+                      void *user)
+{
+    (void)node; (void)user;
+    BaseType_t woken = pdFALSE;
+    if (can_tx_task != NULL) {
+        xTaskNotifyFromISR(can_tx_task, event->is_tx_success ? 1U : 2U,
+                          eSetValueWithOverwrite, &woken);
+    }
+    return woken == pdTRUE;
+}
+
+static bool CanError(twai_node_handle_t node, const twai_error_event_data_t *event,
+                     void *user)
+{
+    (void)node; (void)user;
+    atomic_store(&can_last_error, event->err_flags.val);
+    atomic_fetch_add(&can_bus_errors_total, 1U);
+    return false; /* no logging or blocking from the interrupt */
+}
+
 static esp_err_t CAN_Init(void)
 {
     twai_onchip_node_config_t cfg = {
@@ -128,13 +159,38 @@ static esp_err_t CAN_Init(void)
             .bus_off_indicator = -1,
         },
         .bit_timing.bitrate = CAN_BITRATE,
-        .tx_queue_depth = CAN_TX_QUEUE_LENGTH,
+        /* Single-shot failures return through on_tx_done. No old commands
+         * retried forever when the Bluepill is absent. */
+        .fail_retry_cnt = 0,
+        .tx_queue_depth = 1,
     };
 
     esp_err_t err = twai_new_node_onchip(&cfg, &can_node);
     if (err != ESP_OK) return err;
 
-    return twai_node_enable(can_node);
+    const twai_event_callbacks_t callbacks = { .on_tx_done = CanTxDone, .on_error = CanError };
+    err = twai_node_register_event_callbacks(can_node, &callbacks, NULL);
+    if (err == ESP_OK) { err = twai_node_enable(can_node); }
+    if (err != ESP_OK) {
+        /* A failed enable has not handed any frame to this node. */
+        ESP_ERROR_CHECK(twai_node_delete(can_node));
+        can_node = NULL;
+    }
+    return err;
+}
+
+/* The driver retains frame/data pointers. Delete it before reusing buffers
+ * after a completion timeout; simply leaving a wait does not cancel a TX. */
+static void CAN_Reset(void)
+{
+    if (can_node == NULL) { return; }
+    twai_node_status_t state;
+    ESP_ERROR_CHECK(twai_node_get_info(can_node, &state, NULL));
+    if (state.state != TWAI_ERROR_BUS_OFF) {
+        ESP_ERROR_CHECK(twai_node_disable(can_node));
+    }
+    ESP_ERROR_CHECK(twai_node_delete(can_node));
+    can_node = NULL;
 }
 
 static GpResult CanQueueWrite(void *user, const GpCanFrame *frame)
@@ -149,7 +205,9 @@ static GpResult CanQueueWrite(void *user, const GpCanFrame *frame)
         return GP_INVALID;
     }
 
-    if (xQueueSend(can_tx_queue, frame, 0) != pdTRUE) {
+    const QueuedCanFrame queued = { .frame = *frame, .queued_at = xTaskGetTickCount() };
+    if (xQueueSend(can_tx_queue, &queued, 0) != pdTRUE) {
+        atomic_fetch_add(&can_queue_busy, 1U);
         return GP_PENDING;
     }
 
@@ -158,64 +216,83 @@ static GpResult CanQueueWrite(void *user, const GpCanFrame *frame)
 
 static void CanTxTask(void *argument)
 {
-    GpCanFrame queued_frame;
+    QueuedCanFrame queued;
+    uint32_t tx_ok = 0, tx_fail = 0, timeouts = 0, stale_drop = 0, resets = 0;
+    TickType_t last_report = xTaskGetTickCount();
+    uint16_t last_sequence = 0;
     (void)argument;
+    can_tx_task = xTaskGetCurrentTaskHandle();
 
     for (;;) {
-        if (xQueueReceive(can_tx_queue, &queued_frame, portMAX_DELAY) != pdTRUE) {
-            continue;
+        if (can_node == NULL) {
+            esp_err_t init = CAN_Init();
+            if (init != ESP_OK) {
+                ESP_LOGE(TAG, "CAN INIT FAILED: %s (UART monitoring remains active)", esp_err_to_name(init));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            ESP_LOGI(TAG, "CAN ONLINE: TX=GPIO%d RX=GPIO%d bitrate=%u ID=0x105 normal ACK-required mode",
+                     CAN_TX_PIN, CAN_RX_PIN, CAN_BITRATE);
         }
-
-        twai_frame_t tx_frame = {
-            .header = {
-                .id = queued_frame.id,
-                .ide = false,
-                .rtr = false,
-                .fdf = false,
-                .dlc = queued_frame.dlc,
-            },
-            .buffer = queued_frame.data,
-            .buffer_len = queued_frame.dlc,
-        };
-
-        esp_err_t err = twai_node_transmit(can_node, &tx_frame, -1);
-
-        if (err == ESP_OK) {
-            err = twai_node_transmit_wait_all_done(
-                can_node,
-                pdMS_TO_TICKS(100)
-            );
+        if (xQueueReceive(can_tx_queue, &queued, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if ((TickType_t)(xTaskGetTickCount() - queued.queued_at) > pdMS_TO_TICKS(MAX_QUEUE_MS)) {
+                ++stale_drop;
+            } else {
+                twai_frame_t tx_frame = {
+                    .header = { .id = queued.frame.id, .dlc = queued.frame.dlc },
+                    .buffer = queued.frame.data, .buffer_len = queued.frame.dlc
+                };
+                uint32_t completion = 0;
+                (void)xTaskNotifyWait(0, UINT32_MAX, &completion, 0);
+                esp_err_t err = twai_node_transmit(can_node, &tx_frame, 0);
+                if (err == ESP_OK) {
+                    if (xTaskNotifyWait(0, UINT32_MAX, &completion, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        if (completion == 1U) {
+                            ++tx_ok;
+                            last_sequence = (uint16_t)(queued.frame.data[0] | ((uint16_t)queued.frame.data[1] << 8));
+                            gpio_set_level(LED_PIN, 1);
+                        } else {
+                            ++tx_fail;
+                            gpio_set_level(LED_PIN, 0);
+                        }
+                    } else {
+                        ++timeouts;
+                        ESP_LOGE(TAG, "CAN completion timeout: canceling pending frame before buffer reuse");
+                        gpio_set_level(LED_PIN, 0);
+                        /* Cancel all retained references before this block
+                         * ends and tx_frame goes out of scope. */
+                        CAN_Reset();
+                        ++resets;
+                    }
+                } else {
+                    ++tx_fail;
+                    gpio_set_level(LED_PIN, 0);
+                }
+            }
         }
-
-        if (err == ESP_OK) {
-            char hex[40];
-            DbgHex(hex, sizeof(hex), queued_frame.data, queued_frame.dlc);
-
-            ESP_LOGI(TAG,
-                    "CAN TX SUCCESS: ID=0x%03X DLC=%u DATA=[%s]",
-                    (unsigned)queued_frame.id,
-                    (unsigned)queued_frame.dlc,
-                    hex);
-
-            gpio_set_level(LED_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            gpio_set_level(LED_PIN, 0);
-        } else {
-    ESP_LOGE(TAG, "CAN TX FAILED: %s", esp_err_to_name(err));
-
-    if (err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "Attempting CAN bus-off recovery...");
-
-        esp_err_t recover_err = twai_node_recover(can_node);
-
-        if (recover_err == ESP_OK) {
-            ESP_LOGI(TAG, "CAN recovery initiated");
-        } else {
-            ESP_LOGE(TAG, "CAN recovery request failed: %s",
-                     esp_err_to_name(recover_err));
+        if (can_node != NULL) {
+            twai_node_status_t state;
+            twai_node_record_t record;
+            ESP_ERROR_CHECK(twai_node_get_info(can_node, &state, &record));
+            TickType_t now = xTaskGetTickCount();
+            if ((TickType_t)(now - last_report) >= pdMS_TO_TICKS(1000)) {
+                ESP_LOGI(TAG, "CAN LINK tx_ok=%lu tx_fail=%lu timeout=%lu stale_drop=%lu resets=%lu last_seq=%u state=%d TEC=%u REC=%u bus_err=%lu errors_total=%lu last_error=0x%02lX UART_bytes=%lu frames=%lu gateway_reject=%lu queue_busy=%lu",
+                    (unsigned long)tx_ok, (unsigned long)tx_fail, (unsigned long)timeouts,
+                    (unsigned long)stale_drop, (unsigned long)resets, (unsigned)last_sequence,
+                    (int)state.state, (unsigned)state.tx_error_count, (unsigned)state.rx_error_count,
+                    (unsigned long)record.bus_err_num, (unsigned long)atomic_load(&can_bus_errors_total),
+                    (unsigned long)atomic_load(&can_last_error), (unsigned long)atomic_load(&uart_bytes_total),
+                    (unsigned long)atomic_load(&uart_frames_total), (unsigned long)atomic_load(&gateway_rejected),
+                    (unsigned long)atomic_load(&can_queue_busy));
+                last_report = now;
+            }
+            if (state.state == TWAI_ERROR_BUS_OFF) {
+                ESP_LOGE(TAG, "CAN BUS OFF: check Bluepill CAN-enabled firmware, transceivers, wiring and termination");
+                CAN_Reset();
+                ++resets;
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
         }
-    }
-}
     }
 }
 
@@ -240,14 +317,13 @@ void app_main(void)
     TickType_t chunk_received_at = 0;
     TickType_t pending_since = 0;
 
-    can_tx_queue = xQueueCreate(CAN_TX_QUEUE_LENGTH, sizeof(GpCanFrame));
+    can_tx_queue = xQueueCreate(CAN_TX_QUEUE_LENGTH, sizeof(QueuedCanFrame));
     if (can_tx_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create CAN transmit queue");
         abort();
     }
 
     ESP_ERROR_CHECK(UART_Init());
-    ESP_ERROR_CHECK(CAN_Init());
     UartRx_Init(&uart_rx);
 
     gpio_reset_pin(LED_PIN);
@@ -265,6 +341,7 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "CUERT ESP32 sensing node started");
+    ESP_LOGI(TAG, "FW can-link-v1: start with valid neutral joystick and ARM released; monitor CAN LINK + Bluepill RX");
 #if DEBUG_LOG
     ESP_LOGI(TAG, "DEBUG logging ON: printing 1 of every %u messages", (unsigned)DEBUG_EVERY_N);
 #endif
@@ -283,6 +360,7 @@ void app_main(void)
             }
 
             if (result != GP_OK) {
+                atomic_fetch_add(&gateway_rejected, 1U);
                 ESP_LOGW(TAG, "Queued command rejected: %d", (int)result);
             }
             have_pending_command = false;
@@ -301,6 +379,7 @@ void app_main(void)
             }
 
             read_length = (size_t)bytes_read;
+            atomic_fetch_add(&uart_bytes_total, (uint32_t)bytes_read);
             read_offset = 0u;
             chunk_received_at = xTaskGetTickCount();
 
@@ -342,13 +421,17 @@ void app_main(void)
 #endif
 
         if (result == GP_OK) {
+            atomic_fetch_add(&uart_frames_total, 1U);
             result = Gateway_Forward(&gateway, &command, QueueAgeMs(chunk_received_at));
             if (result == GP_PENDING) {
                 pending_command = command;
                 pending_since = chunk_received_at;
                 have_pending_command = true;
             } else if (result != GP_OK) {
-                ESP_LOGW(TAG, "UART command rejected: %d", (int)result);
+                uint32_t rejected = atomic_fetch_add(&gateway_rejected, 1U);
+                if ((rejected % 50U) == 0U) {
+                    ESP_LOGW(TAG, "UART command rejected: %d; initial command must be valid neutral with ARM released", (int)result);
+                }
             }
 
 #if DEBUG_LOG
